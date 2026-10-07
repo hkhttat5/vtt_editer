@@ -148,7 +148,8 @@ class MainWindow(QMainWindow):
 
         # ------------------------------------------------------------- dock list
         self.cue_panel = CueListPanel(self)
-        self.cue_panel.cueActivated.connect(self.goto_cue)
+        # Clicking a cue in the side list jumps to it AND loops its segment
+        self.cue_panel.cueActivated.connect(self.goto_cue_looping)
         self.dock = QDockWidget("Cues", self)
         self.dock.setWidget(self.cue_panel)
         self.dock.setAllowedAreas(
@@ -394,7 +395,8 @@ class MainWindow(QMainWindow):
         self.dock.setVisible(True)
         self.cue_panel.focus_search()
 
-    def goto_cue(self, index: int, seek: bool = True, play: bool = True) -> None:
+    def goto_cue(self, index: int, seek: bool = True, play: bool = True,
+                 loop: bool = False) -> None:
         if self.project.document is None or not (0 <= index < self.project.cue_count):
             return
         # do NOT auto-commit text on plain navigation; instead keep the edit
@@ -406,10 +408,23 @@ class MainWindow(QMainWindow):
         self._load_cue_into_editor(index)
         cue = self.project.cue(index)
         if seek and self.video_player.has_media:
+            self.video_player.disable_loop()
             self.video_player.seek_seconds(cue.start, play=play)
+            if loop:
+                # Loop this cue's segment so the user can watch it repeatedly
+                # while comparing with the VTT text.
+                self.video_player.enable_loop_for_range(cue.start, cue.end)
+                self.statusBar().showMessage(
+                    f"🔁 Looping cue {index + 1} "
+                    f"[{cue.start_str} → {cue.end_str}]  "
+                    "(Enter / ← / → or manual seek stops the loop)", 5000)
         self.cue_panel.highlight_current(index)
         self.cue_panel.set_reviewed_stats(
             self.project.reviewed_count, self.project.cue_count)
+
+    def goto_cue_looping(self, index: int) -> None:
+        """Cue-list click: jump to the cue and loop its video segment."""
+        self.goto_cue(index, seek=True, play=True, loop=True)
 
     def _load_cue_into_editor(self, index: int) -> None:
         cue = self.project.cue(index)
@@ -456,6 +471,8 @@ class MainWindow(QMainWindow):
         if nxt < self.project.cue_count:
             self.goto_cue(nxt, seek=True, play=True)
         else:
+            # last cue reached → stop looping / playing
+            self.video_player.disable_loop()
             self.video_player.pause()
             self.statusBar().showMessage(
                 "Reached last cue. Press Ctrl+S to save.", 6000)
@@ -517,6 +534,8 @@ class MainWindow(QMainWindow):
 
     def _slider_released(self) -> None:
         self._seeking_slider = False
+        # manual scrubbing exits the cue loop
+        self.video_player.disable_loop()
         self.video_player.seek_ms(self.slider.value())
 
     def _cycle_speed(self) -> None:

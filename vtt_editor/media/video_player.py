@@ -26,6 +26,10 @@ class VideoPlayer(QObject):
     VIDEO_EXTENSIONS = {".mp4", ".mkv", ".webm", ".mov", ".avi", ".m4v",
                         ".wmv", ".flv", ".ts", ".mts", ".mpg", ".mpeg"}
 
+    # A/V sync tolerance (ms): we only re-seek when the position has drifted
+    # outside [loop_start - tol, loop_end + tol] instead of on every tick.
+    LOOP_TOLERANCE_MS = 150
+
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
         self.video_widget = QVideoWidget()
@@ -50,6 +54,11 @@ class VideoPlayer(QObject):
 
         self._media_available = False
 
+        # A-B loop state (loop the current cue's segment while reviewing it)
+        self._loop_active = False
+        self._loop_start_ms = 0
+        self._loop_end_ms = 0
+
     # ------------------------------------------------------------------ state
     def _on_state(self, state) -> None:
         if state == QMediaPlayer.PlaybackState.PlayingState:
@@ -63,6 +72,37 @@ class VideoPlayer(QObject):
     def is_playing(self) -> bool:
         return self.player.playbackState() == QMediaPlayer.PlaybackState.PlayingState
 
+    # ------------------------------------------------------------------- loop
+    @property
+    def loop_active(self) -> bool:
+        return self._loop_active
+
+    def set_loop(self, start_ms: int, end_ms: int) -> None:
+        """Enable an A-B loop over [start_ms, end_ms]."""
+        self._loop_start_ms = max(0, int(start_ms))
+        self._loop_end_ms = max(self._loop_start_ms + 1, int(end_ms))
+        self._loop_active = True
+
+    def enable_loop_for_range(self, start_s: float, end_s: float) -> None:
+        """Convenience: loop a cue given in seconds (with a small tail)."""
+        self.set_loop(int(start_s * 1000), int((end_s + 0.25) * 1000))
+
+    def disable_loop(self) -> None:
+        self._loop_active = False
+
+    def _on_position(self, ms: int) -> None:
+        """Keep playback inside the active A-B loop segment."""
+        if not self._loop_active:
+            return
+        tol = self.LOOP_TOLERANCE_MS
+        if ms >= self._loop_end_ms or ms < self._loop_start_ms - tol:
+            # re-seek only when the position has actually drifted outside the
+            # segment (a seek may lag one tick behind on some backends)
+            if abs(ms - self._loop_start_ms) > tol:
+                self.player.setPosition(self._loop_start_ms)
+            if not self.is_playing:
+                self.player.play()
+
     # ------------------------------------------------------------------ media
     def open(self, path: str) -> bool:
         if not path or not os.path.isfile(path):
@@ -75,6 +115,7 @@ class VideoPlayer(QObject):
         self.player.stop()
         self.player.setSource(QUrl())
         self._media_available = False
+        self.disable_loop()
 
     # ------------------------------------------------------------------- time
     @property
@@ -113,12 +154,16 @@ class VideoPlayer(QObject):
 
     def toggle_play_pause(self) -> None:
         if self.is_playing:
+            # Pause button / Space must really stop the video, even mid-loop —
+            # the user wants to freeze the frame and read the text.
+            # (The loop's internal auto-resume only fires on boundary hits.)
             self.pause()
         else:
             self.play()
 
     def stop(self) -> None:
         self.player.stop()
+        self.disable_loop()
 
     # ------------------------------------------------------------------ volume
     def set_volume(self, percent: int) -> None:
