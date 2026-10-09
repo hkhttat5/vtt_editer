@@ -185,21 +185,43 @@ class VideoPlayer(QObject):
     def step_frame(self, direction: int = 1) -> None:
         """Move exactly one frame using the source FPS when known.
 
-        Falls back to a short configurable interval when the frame rate is
-        unknown — variable-frame-rate sources cannot be stepped frame-exactly
-        through the multimedia backend, and we do not claim otherwise.
+        Playback is paused first and never resumed automatically; the new
+        position is clamped between the first (0 ms) and last (duration)
+        frame of the media.  Falls back to a short configurable interval
+        when the frame rate is unknown — variable-frame-rate sources cannot
+        be stepped frame-exactly through the multimedia backend, and we do
+        not claim otherwise.
         """
         if not self._media_available:
             return
+        self.pause()
+        self.disable_loop()
         f = self.fps
         if f > 0:
             delta_ms = max(1, int(round(1000.0 * direction / f)))
         else:
             delta_ms = 40 * direction          # ~25 fps guess, clearly labelled
-        self.pause()
-        new_pos = max(0, min(self.duration_ms or 0, self.position_ms + delta_ms)) \
-            if self.duration_ms else max(0, self.position_ms + delta_ms)
-        self.player.setPosition(new_pos)
+        self.seek_relative_ms(delta_ms)
+
+    def seek_relative_ms(self, delta_ms: int) -> None:
+        """Seek by *delta_ms*, clamped to [0, duration] (first/last frame).
+
+        For constant-frame-rate media the target is snapped onto the frame
+        grid (multiples of 1/fps), so repeated ±1-frame steps never drift.
+        """
+        if not self._media_available:
+            return
+        new_pos = self.position_ms + int(delta_ms)
+        dur = self.duration_ms
+        if dur > 0:
+            new_pos = min(new_pos, dur)
+        f = self.fps
+        if f > 0:
+            frame_ms = 1000.0 / f
+            new_pos = int(round(new_pos / frame_ms) * frame_ms)
+            if dur > 0:
+                new_pos = min(new_pos, dur)
+        self.player.setPosition(max(0, new_pos))
 
     def step_seconds(self, seconds: float) -> None:
         """Seek backward/forward by a configurable interval (default 1 s)."""
