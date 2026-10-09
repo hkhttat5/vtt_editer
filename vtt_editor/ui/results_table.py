@@ -95,13 +95,16 @@ class SubtitleTable(QWidget):
 
         self.table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         self.table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
-        self.table.setEditTriggers(QAbstractItemView.EditTrigger.DoubleClick
-                                   | QAbstractItemView.EditTrigger.SelectedClicked)
+        self.table.setEditTriggers(QAbstractItemView.EditTrigger.DoubleClicked
+                                   | QAbstractItemView.EditTrigger.SelectedClicked
+                                   | QAbstractItemView.EditTrigger.EditKeyPressed)
         self.table.verticalHeader().setVisible(False)
         mono = QFont("Consolas", 10)
         self.table.setFont(mono)
         self.table.itemSelectionChanged.connect(self._on_selection_changed)
         self.table.itemChanged.connect(self._on_item_changed)
+        # Qt's default item delegate already commits an in-place edit on
+        # Enter and cancels it on Escape — no extra wiring is required.
         layout.addWidget(self.table, stretch=1)
 
         self.count_label = QLabel("0 cues")
@@ -131,13 +134,15 @@ class SubtitleTable(QWidget):
         try:
             if index in self._row_map:
                 row = self._row_map.index(index)
-                sel = self.table.selectionModel()
-                sel.selectRow(row,
-                              Qt.SelectionCommand.ClearAndSelect
-                              | Qt.SelectionCommand.Rows)
+                from PySide6.QtCore import QItemSelectionModel as _QISM
+                self.table.selectionModel().select(
+                    self.table.model().index(row, 0),
+                    _QISM.SelectionFlag.ClearAndSelect
+                    | _QISM.SelectionFlag.Rows)
                 if scroll:
-                    self.table.scrollTo(self.table.indexAt(row, 0),
-                                        QAbstractItemView.ScrollHint.PositionAtCenter)
+                    self.table.scrollTo(
+                        self.table.model().index(row, 0),
+                        QAbstractItemView.ScrollHint.PositionAtCenter)
             else:
                 self.table.clearSelection()
         finally:
@@ -156,7 +161,7 @@ class SubtitleTable(QWidget):
             self._updating = False
         if preserve_selection and selected >= 0:
             self.select_cue(selected, scroll=False)
-        elif preserve_selection and self._row_map:
+        elif self._row_map and not preserve_selection:
             self.select_cue(self._row_map[0], scroll=False)
 
     def _matches(self, cue) -> bool:

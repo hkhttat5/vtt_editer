@@ -189,11 +189,12 @@ class CueEditorPanel(QWidget):
         root.addLayout(times)
 
         frames = QHBoxLayout()
+        # integer ±1 => frame stepping; ±1.5 => 1-second jump (marker values)
         for label, delta in (("−1 frame", -1), ("+1 frame", +1),
-                             ("−1 s", -1.0), ("+1 s", +1.0)):
+                             ("−1 s", -1.5), ("+1 s", +1.5)):
             b = QPushButton(label)
-            b.setToolTip(f"Step the paused video ({label}) and copy its "
-                         "position into Start")
+            b.setToolTip(f"Pause and step the video ({label}); it never "
+                         "resumes playback automatically.")
             b.clicked.connect(lambda _c=False, d=delta: self.stepSecondsRequested.emit(d))
             frames.addWidget(b)
         self.copy_start_btn = QPushButton("Start ← video position")
@@ -236,6 +237,10 @@ class CueEditorPanel(QWidget):
 
         self.start_edit.textChanged.connect(self._update_duration)
         self.end_edit.textChanged.connect(self._update_duration)
+        # Enter = Apply Changes throughout the panel's editing workflow
+        self.start_edit.returnPressed.connect(self.apply_current)
+        self.end_edit.returnPressed.connect(self.apply_current)
+        self.text_edit.installEventFilter(self)
         # remember current video position provider (set by main window)
         self.video_position_provider = None   # callable -> seconds or None
 
@@ -258,6 +263,30 @@ class CueEditorPanel(QWidget):
             self.btn_merge.setEnabled(index + 1 < self._cue_total())
         finally:
             self._loading = False
+
+    def start_add_mode(self, start: float, end: float) -> None:
+        """Prepare the panel for creating a NEW cue (index stays -1)."""
+        from core.vtt_parser import format_timestamp as _fmt
+        self._loading = True
+        try:
+            self._index = -1
+            self.id_label.setText("Subtitle ID: NEW")
+            self.text_edit.setPlainText("")
+            self.start_edit.setText(_fmt(start))
+            self.end_edit.setText(_fmt(end))
+            self.error_label.setText("")
+            self.review_label.setText("○ Not reviewed")
+            self.review_label.setStyleSheet("color: gray;")
+            self._update_duration()
+            for b in (self.btn_revert, self.btn_review, self.btn_delete,
+                      self.btn_split, self.btn_merge):
+                b.setEnabled(False)
+            self.btn_apply.setEnabled(True)
+            self.btn_prev.setEnabled(False)
+            self.btn_next.setEnabled(False)
+        finally:
+            self._loading = False
+        self.text_edit.setFocus()
 
     def clear(self) -> None:
         self._index = -1
@@ -302,9 +331,14 @@ class CueEditorPanel(QWidget):
         self.applyRequested.emit(self._index, text, start, end)
 
     def revert_current(self) -> None:
+        """Discard pending edits by reloading the cue from the model."""
         if self._index < 0:
             return
         self.set_error("")
+        parent = self.window()
+        proj = getattr(parent, "project", None)
+        if proj is not None and 0 <= self._index < proj.cue_count:
+            self.load_cue(self._index, proj.cue(self._index))
 
     @property
     def current_index(self) -> int:
@@ -315,6 +349,16 @@ class CueEditorPanel(QWidget):
         return self._loading
 
     # ------------------------------------------------------------- internal
+    def eventFilter(self, obj, event):               # noqa: N802
+        """Enter inside the multi-line text field applies the changes."""
+        if obj is self.text_edit and event.type() == event.Type.KeyPress:
+            if (event.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter)
+                    and not event.modifiers()):
+                if self._index >= 0 or self.parent() is not None:
+                    self.apply_current()
+                    return True
+        return super().eventFilter(obj, event)
+
     def _cue_total(self) -> int:
         parent = self.window()
         proj = getattr(parent, "project", None)
@@ -329,14 +373,21 @@ class CueEditorPanel(QWidget):
             self.review_label.setStyleSheet("color: gray;")
 
     def _update_duration(self) -> None:
+        """Live duration display; invalid input shows '?' + hint (no corruption)."""
         if self._loading:
             return
         try:
             s = parse_user_timestamp(self.start_edit.text())
             e = parse_user_timestamp(self.end_edit.text())
             self.duration_label.setText(f"{max(0.0, e - s):.3f} s")
-        except ValueError:
+            if e <= s:
+                self.error_label.setText(
+                    "End time must be greater than start time.")
+            else:
+                self.error_label.setText("")
+        except ValueError as exc:
             self.duration_label.setText("? s")
+            self.error_label.setText(str(exc))
 
     def _seek(self, line_edit: TimeLineEdit) -> None:
         try:
