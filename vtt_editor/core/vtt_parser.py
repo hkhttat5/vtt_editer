@@ -82,6 +82,15 @@ class Cue:
     def end_str(self) -> str:
         return format_timestamp(self.end)
 
+    @property
+    def duration(self) -> float:
+        """Cue duration in seconds (0.0 when timing data is invalid)."""
+        try:
+            d = float(self.end) - float(self.start)
+        except (TypeError, ValueError):
+            return 0.0
+        return d if d > 0 else 0.0
+
 
 @dataclass
 class VttDocument:

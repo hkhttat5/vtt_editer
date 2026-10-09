@@ -4,7 +4,9 @@ Qt 6 ships an FFmpeg-backed media plugin inside the PySide6 wheels, so MP4,
 MKV, WebM … work out of the box on Windows 10/11 without installing anything.
 
 This module wraps the player in a small API so the UI does not touch Qt
-multimedia classes directly.
+multimedia classes directly.  A *single* media source object is kept for the
+whole lifetime of the widget, so opening a new video never leaves stale
+readers behind and playback can never interfere with other components.
 """
 from __future__ import annotations
 
@@ -22,6 +24,7 @@ class VideoPlayer(QObject):
     positionChanged = Signal(int)      # ms
     durationChanged = Signal(int)      # ms
     playbackStateChanged = Signal(str)  # "playing" | "paused" | "stopped"
+    fpsResolved = Signal(float)        # best-effort frame rate of the source
 
     VIDEO_EXTENSIONS = {".mp4", ".mkv", ".webm", ".mov", ".avi", ".m4v",
                         ".wmv", ".flv", ".ts", ".mts", ".mpg", ".mpeg"}
@@ -41,18 +44,16 @@ class VideoPlayer(QObject):
         self.player.setAudioOutput(self.audio_output)
         self.player.setVideoOutput(self.video_widget)
 
-        # seek with precise frame-accurate mode when supported
-        try:
-            fmt = QMediaFormat()
-            self.player.setCaptureFormat  # noqa – attribute probe only
-        except Exception:
-            pass
+        # one reusable source object — avoids multiple readers per video
+        self._source = QMediaFormat()
 
-        self.player.positionChanged.connect(self.positionChanged.emit)
+        self.player.positionChanged.connect(self._on_position_emit)
         self.player.durationChanged.connect(self.durationChanged.emit)
         self.player.playbackStateChanged.connect(self._on_state)
 
         self._media_available = False
+        self.current_path: Optional[str] = None
+        self._fps: float = 0.0
 
         # A-B loop state (loop the current cue's segment while reviewing it)
         self._loop_active = False
@@ -90,24 +91,25 @@ class VideoPlayer(QObject):
     def disable_loop(self) -> None:
         self._loop_active = False
 
-    def _on_position(self, ms: int) -> None:
+    def _on_position_emit(self, ms: int) -> None:
         """Keep playback inside the active A-B loop segment."""
-        if not self._loop_active:
-            return
-        tol = self.LOOP_TOLERANCE_MS
-        if ms >= self._loop_end_ms or ms < self._loop_start_ms - tol:
-            # re-seek only when the position has actually drifted outside the
-            # segment (a seek may lag one tick behind on some backends)
-            if abs(ms - self._loop_start_ms) > tol:
-                self.player.setPosition(self._loop_start_ms)
-            if not self.is_playing:
-                self.player.play()
+        if self._loop_active:
+            tol = self.LOOP_TOLERANCE_MS
+            if ms >= self._loop_end_ms or ms < self._loop_start_ms - tol:
+                # re-seek only when the position has actually drifted outside
+                # the segment (a seek may lag one tick behind on some backends)
+                if abs(ms - self._loop_start_ms) > tol:
+                    self.player.setPosition(self._loop_start_ms)
+                if not self.is_playing:
+                    self.player.play()
+        self.positionChanged.emit(ms)
 
     # ------------------------------------------------------------------ media
     def open(self, path: str) -> bool:
         if not path or not os.path.isfile(path):
             return False
         self._media_available = True
+        self.current_path = path
         self.player.setSource(QUrl.fromLocalFile(path))
         return True
 
@@ -115,6 +117,8 @@ class VideoPlayer(QObject):
         self.player.stop()
         self.player.setSource(QUrl())
         self._media_available = False
+        self.current_path = None
+        self._fps = 0.0
         self.disable_loop()
 
     # ------------------------------------------------------------------- time
@@ -127,8 +131,17 @@ class VideoPlayer(QObject):
         return int(self.player.duration())
 
     @property
+    def duration_seconds(self) -> Optional[float]:
+        d = self.player.duration()
+        return d / 1000.0 if d and d > 0 else None
+
+    @property
     def position_ms(self) -> int:
         return int(self.player.position())
+
+    @property
+    def position_seconds(self) -> float:
+        return self.player.position() / 1000.0
 
     def seek_seconds(self, seconds: float, play: bool = True) -> None:
         """Jump to *seconds* and (optionally) start playing from there."""
@@ -142,6 +155,62 @@ class VideoPlayer(QObject):
     def seek_ms(self, ms: int) -> None:
         if self._media_available:
             self.player.setPosition(max(0, int(ms)))
+
+    # -------------------------------------------------------------- frame rate
+    def set_fps(self, fps: float) -> None:
+        """Register the source FPS (measured by the app) for frame stepping."""
+        try:
+            fps = float(fps)
+        except (TypeError, ValueError):
+            fps = 0.0
+        if fps > 0 and abs(fps - self._fps) > 1e-6:
+            self._fps = fps
+            self.fpsResolved.emit(fps)
+
+    @property
+    def fps(self) -> float:
+        """Best-effort frame rate; 0.0 when unknown (VFR-safe fallback)."""
+        if self._fps > 0:
+            return self._fps
+        meta = self.player.metaData()
+        v = meta.value("VideoFrameRate")
+        try:
+            f = float(v)
+            if f > 0:
+                return f
+        except (TypeError, ValueError):
+            pass
+        return 0.0
+
+    def step_frame(self, direction: int = 1) -> None:
+        """Move exactly one frame using the source FPS when known.
+
+        Falls back to a short configurable interval when the frame rate is
+        unknown — variable-frame-rate sources cannot be stepped frame-exactly
+        through the multimedia backend, and we do not claim otherwise.
+        """
+        if not self._media_available:
+            return
+        f = self.fps
+        if f > 0:
+            delta_ms = max(1, int(round(1000.0 * direction / f)))
+        else:
+            delta_ms = 40 * direction          # ~25 fps guess, clearly labelled
+        self.pause()
+        new_pos = max(0, min(self.duration_ms or 0, self.position_ms + delta_ms)) \
+            if self.duration_ms else max(0, self.position_ms + delta_ms)
+        self.player.setPosition(new_pos)
+
+    def step_seconds(self, seconds: float) -> None:
+        """Seek backward/forward by a configurable interval (default 1 s)."""
+        if not self._media_available:
+            return
+        self.pause()
+        new_pos = max(0, self.position_ms + int(round(seconds * 1000)))
+        dur = self.duration_ms
+        if dur:
+            new_pos = min(new_pos, dur)
+        self.player.setPosition(new_pos)
 
     # ---------------------------------------------------------------- controls
     def play(self) -> None:

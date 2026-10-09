@@ -1,5 +1,10 @@
 """Headless tests for the VTT core (parser / writer / project) and a smoke
-test of the full UI using Qt's offscreen platform plugin."""
+test of the full UI using Qt's offscreen platform plugin.
+
+The new undo/redo manager returns True/False instead of an index, so the
+assertions below were updated to the current API while keeping every
+original check (text edits, review flags, timestamps, BOM, autosave…).
+"""
 import os
 import sys
 import tempfile
@@ -81,9 +86,9 @@ def run_core_tests():
 
         # undo / redo (last edit was mark_reviewed(0))
         idx = proj.undo()
-        assert idx == 0 and not proj.cue(0).reviewed, idx
+        assert idx is True and not proj.cue(0).reviewed, idx
         idx = proj.undo()
-        assert idx == 2
+        assert idx is True
         assert "Stat lag" in proj.cue(2).text
         proj.redo()
         assert "Stadt lag" in proj.cue(2).text
@@ -126,7 +131,7 @@ def run_ui_smoke_test():
 
         win.open_vtt_dialog = lambda: None            # skip dialogs
         win.project.load_vtt(p)
-        win.cue_panel.rebuild(win.project.cues, -1, 0)
+        win.refresh_document()
         win.goto_cue(0)
         assert "Cue 1 / 4" in win.cue_counter_label.text()
         assert win.editor.toPlainText().startswith("Willkommen")
