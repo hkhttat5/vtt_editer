@@ -54,6 +54,7 @@ class VideoPlayer(QObject):
         self._media_available = False
         self.current_path: Optional[str] = None
         self._fps: float = 0.0
+        self._tracker_ms: int = 0     # last known/committed position (ms)
 
         # A-B loop state (loop the current cue's segment while reviewing it)
         self._loop_active = False
@@ -93,6 +94,7 @@ class VideoPlayer(QObject):
 
     def _on_position_emit(self, ms: int) -> None:
         """Keep playback inside the active A-B loop segment."""
+        self._tracker_ms = int(ms)       # backend confirms its real position
         if self._loop_active:
             tol = self.LOOP_TOLERANCE_MS
             if ms >= self._loop_end_ms or ms < self._loop_start_ms - tol:
@@ -110,6 +112,7 @@ class VideoPlayer(QObject):
             return False
         self._media_available = True
         self.current_path = path
+        self._tracker_ms = 0
         self.player.setSource(QUrl.fromLocalFile(path))
         return True
 
@@ -144,17 +147,30 @@ class VideoPlayer(QObject):
         return self.player.position() / 1000.0
 
     def seek_seconds(self, seconds: float, play: bool = True) -> None:
-        """Jump to *seconds* and (optionally) start playing from there."""
+        """Jump to *seconds* and (optionally) start playing from there.
+
+        The target is clamped to the loaded media's duration so a cue that
+        extends beyond the video can never push the position past the end.
+        """
         if not self._media_available:
             return
         ms = max(0, int(seconds * 1000))
+        dur = self.duration_ms
+        if dur > 0:
+            ms = min(ms, dur)
+        self._tracker_ms = ms
         self.player.setPosition(ms)
         if play:
             self.play()
 
     def seek_ms(self, ms: int) -> None:
         if self._media_available:
-            self.player.setPosition(max(0, int(ms)))
+            target = max(0, int(ms))
+            dur = self.duration_ms
+            if dur > 0:
+                target = min(target, dur)
+            self._tracker_ms = target
+            self.player.setPosition(target)
 
     # -------------------------------------------------------------- frame rate
     def set_fps(self, fps: float) -> None:
@@ -172,13 +188,17 @@ class VideoPlayer(QObject):
         """Best-effort frame rate; 0.0 when unknown (VFR-safe fallback)."""
         if self._fps > 0:
             return self._fps
-        meta = self.player.metaData()
-        v = meta.value("VideoFrameRate")
         try:
-            f = float(v)
-            if f > 0:
-                return f
-        except (TypeError, ValueError):
+            meta = self.player.metaData()
+            for key in ("VideoFrameRate", "AspectRatio"):
+                v = meta.value(key)
+                try:
+                    f = float(v)
+                except (TypeError, ValueError):
+                    continue
+                if f > 0:
+                    return f
+        except Exception:                 # metaData API varies by PySide6 build
             pass
         return 0.0
 
@@ -191,17 +211,41 @@ class VideoPlayer(QObject):
         when the frame rate is unknown — variable-frame-rate sources cannot
         be stepped frame-exactly through the multimedia backend, and we do
         not claim otherwise.
+
+        The move is computed from an *internal* position tracker instead of
+        ``QMediaPlayer.position()``: some backends report the raw requested
+        seek value there while their decoder actually snapped the seek to the
+        previous keyframe, which would make repeated ±1-frame steps stall or
+        drift.  Whenever the backend confirms its real playback position via
+        ``positionChanged`` we synchronise the tracker with it.
         """
         if not self._media_available:
             return
         self.pause()
         self.disable_loop()
         f = self.fps
+        base = self._tracker_ms
+        dur = self.duration_ms
+        if dur > 0 and abs(base - self.position_ms) > max(250, int(1000 / max(f, 1))):
+            # tracker far behind reality (e.g. an external seek that produced
+            # no position event yet) — trust the reported position instead
+            base = self.position_ms
         if f > 0:
-            delta_ms = max(1, int(round(1000.0 * direction / f)))
+            frame_ms = 1000.0 / f
+            n = int(round(base / frame_ms)) + int(direction)
+            n = max(0, n)
+            if dur > 0:
+                n = min(n, int(dur / frame_ms))
+            target = int(round(n * frame_ms))
+            if dur > 0:
+                target = min(target, dur)
+            if target == base:
+                return                      # already at first/last frame
+            self._tracker_ms = target
+            self.player.setPosition(target)
         else:
             delta_ms = 40 * direction          # ~25 fps guess, clearly labelled
-        self.seek_relative_ms(delta_ms)
+            self.seek_relative_ms(delta_ms)
 
     def seek_relative_ms(self, delta_ms: int) -> None:
         """Seek by *delta_ms*, clamped to [0, duration] (first/last frame).
@@ -221,7 +265,9 @@ class VideoPlayer(QObject):
             new_pos = int(round(new_pos / frame_ms) * frame_ms)
             if dur > 0:
                 new_pos = min(new_pos, dur)
-        self.player.setPosition(max(0, new_pos))
+        new_pos = max(0, new_pos)
+        self._tracker_ms = new_pos
+        self.player.setPosition(new_pos)
 
     def step_seconds(self, seconds: float) -> None:
         """Seek backward/forward by a configurable interval (default 1 s)."""
@@ -232,6 +278,7 @@ class VideoPlayer(QObject):
         dur = self.duration_ms
         if dur:
             new_pos = min(new_pos, dur)
+        self._tracker_ms = new_pos
         self.player.setPosition(new_pos)
 
     # ---------------------------------------------------------------- controls
